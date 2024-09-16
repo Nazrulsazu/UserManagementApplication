@@ -1,4 +1,4 @@
-﻿// Licensed to the .NET Foundation under one or more agreements.
+// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 #nullable disable
 
@@ -17,6 +17,7 @@ using Microsoft.AspNetCore.Identity.UI.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
 using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using UserManagementApp.Models;
 
@@ -111,29 +112,50 @@ namespace UserManagementApp.Areas.Identity.Pages.Account
         {
             returnUrl ??= Url.Content("~/");
             ExternalLogins = (await _signInManager.GetExternalAuthenticationSchemesAsync()).ToList();
+
             if (ModelState.IsValid)
             {
+                // Find if a user already exists with the same email
                 var existingUser = await _userManager.FindByEmailAsync(Input.Email);
 
-                // Check if the user was soft-deleted and allow re-registration
-                if (existingUser != null && existingUser.IsDeleted)
+                // Check if the user is soft-deleted
+                if (existingUser != null)
                 {
-                    // Restore the user account
-                    existingUser.IsDeleted = false;
-                    existingUser.Status = "Active";
-                    existingUser.RegistrationTime = DateTime.UtcNow; // Reset registration time
-                    await _userManager.UpdateAsync(existingUser);
+                    if (existingUser.IsDeleted)
+                    {
+                        // Restore the soft-deleted user
+                        existingUser.IsDeleted = false;
+                        existingUser.Status = "Active"; // Reset status to active
+                        existingUser.RegistrationTime = DateTime.UtcNow; // Update registration time
+                        await _userManager.UpdateAsync(existingUser);
 
-                    _logger.LogInformation("Restored a previously deleted user.");
-                    await _signInManager.SignInAsync(existingUser, isPersistent: false);
-                    return LocalRedirect(returnUrl);
+                        _logger.LogInformation("Restored a previously deleted user.");
+                        await _signInManager.SignInAsync(existingUser, isPersistent: false);
+                        return LocalRedirect(returnUrl);
+                    }
+
+                    if (existingUser.Status == "Blocked")
+                    {
+                        // Blocked user cannot re-register or sign in
+                        ModelState.AddModelError(string.Empty, "Your account is blocked. Please contact support.");
+                        return Page(); // Display error and stop registration process
+                    }
+
+                    // If the user exists and is not blocked/deleted, prevent re-registration
+                    ModelState.AddModelError(string.Empty, "This email is already registered.");
+                    return Page();
                 }
-                var user = CreateUser();
 
+                // Proceed with new user registration if the email is not already registered
+                var user = CreateUser();
                 await _userStore.SetUserNameAsync(user, Input.Email, CancellationToken.None);
                 await _emailStore.SetEmailAsync(user, Input.Email, CancellationToken.None);
 
+                // Set registration time and user defaults
                 user.RegistrationTime = DateTime.UtcNow;
+                user.Status = "Active"; // New users should be active by default
+               
+                try{ 
                 var result = await _userManager.CreateAsync(user, Input.Password);
 
                 if (result.Succeeded)
@@ -162,15 +184,28 @@ namespace UserManagementApp.Areas.Identity.Pages.Account
                         return LocalRedirect(returnUrl);
                     }
                 }
+
                 foreach (var error in result.Errors)
                 {
                     ModelState.AddModelError(string.Empty, error.Description);
                 }
             }
-
+            catch (DbUpdateException ex)
+                {
+                    if (ex.InnerException != null && ex.InnerException.Message.Contains("Cannot insert duplicate key row"))
+                    {
+                        ModelState.AddModelError(string.Empty, "The email address is already registered.");
+                    }
+                    else
+                    {
+                        throw; // Re-throw if it's not a duplicate key exception
+                    }
+                }
+            }
             // If we got this far, something failed, redisplay form
             return Page();
         }
+
 
         private ApplicationUser CreateUser()
         {
